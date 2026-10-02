@@ -9,6 +9,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="format-detection" content="telephone=no">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
 <meta name="apple-mobile-web-app-title" content="Ledgerbook">
 <title>Ledgerbook</title>
 <link rel="icon" type="image/png" href="logo-ahba.png">
@@ -156,6 +157,13 @@ td.r,th.r{text-align:right}
 .field{display:flex;flex-direction:column;gap:4px;min-width:0}
 .field.full{grid-column:1/-1}
 .field label{font-size:.8rem;font-weight:600;color:var(--muted)}
+button.sync{background:none;border:0;padding:4px 6px;cursor:pointer;min-height:0}
+.sync.offline{color:var(--warn)}
+.conf{border:1px solid var(--line);border-radius:8px;margin:0 0 10px;padding:6px 8px}
+.conf legend{font-weight:600;font-size:.8rem;color:var(--muted);padding:0 4px}
+.opt{display:flex;gap:8px;align-items:flex-start;padding:8px;border-radius:6px;cursor:pointer;font-size:.9rem}
+.opt:hover{background:var(--sunk)}.opt input{margin-top:4px;flex:none}
+.conf-list{max-height:55vh;overflow:auto}
 .pwrap{position:relative;display:flex}.pwrap input{padding-right:62px}.pwtoggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;color:var(--muted,#667);font:inherit;font-size:.82rem;font-weight:600;padding:6px 8px;cursor:pointer}
 .field input,.field select{padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--sunk);width:100%}
 .field .hint{font-size:.78rem;color:var(--muted)}
@@ -206,7 +214,7 @@ button,a,select,input,label,[data-act]{touch-action:manipulation}
 html{padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
 [hidden]{display:none!important}
 </style>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.js"></script>
+<script src="vendor/supabase.js"></script>
 </head>
 <body>
 
@@ -219,7 +227,7 @@ html{padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
         <div class="label" id="mLabel">—</div>
         <button id="mNext" aria-label="Next month">›</button>
       </div>
-      <span class="sync saved" id="sync" hidden>All changes saved</span>
+      <button type="button" class="sync saved" id="sync" data-act="sync-click" hidden>All changes saved</button>
       <button class="btn primary" id="quickAdd" hidden>+ Transaction</button>
       <button class="btn" id="signOutBtn" data-act="sign-out" hidden>Log out</button>
     </div>
@@ -302,11 +310,90 @@ const TABLES = {
   recurring: { from: fromRec, rows: () => S.recurring },
   transactions: { from: fromTx, rows: () => Object.values(S.months).flat() }
 };
-const synced = { accounts: new Map(), recurring: new Map(), transactions: new Map(), settings: '' };
-const settingsRow = () => JSON.stringify({ currency: S.settings.currency, name: S.settings.name, example: !!S.settings.example, categories: S.categories });
-const snapshotOf = T => new Map(T.rows().map(r => [r.id, JSON.stringify(T.from(r))]));
-function markSynced() { for (const [k, T] of Object.entries(TABLES)) synced[k] = snapshotOf(T); synced.settings = settingsRow(); }
+/* ---------- offline-first storage + sync ---------- */
+const forceOffline = /[?&]offline=1\b/.test(location.search);
+const canReach = () => navigator.onLine && !forceOffline;
+const SYNC_KEYS = ['accounts', 'recurring', 'transactions', 'settings'];
+const emptyBase = () => ({ accounts: new Map(), recurring: new Map(), transactions: new Map(), settings: new Map() });
+let base = emptyBase();          // last state known to match the cloud
+let conflicts = [];              // records changed differently here and in the cloud
+let dirty = false, syncing = false, syncError = false, syncTimer, persistTimer, promptedSig = '';
+let offlineUser = null;
+try { offlineUser = JSON.parse(localStorage.getItem('lb:lastUser') || 'null'); } catch {}
+const curUid = () => session?.user?.id || offlineUser?.id || null;
+const curEmail = () => session?.user?.email || offlineUser?.email || '';
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
+/* @merge-start */
+const stripNext = j => { if (j === undefined) return j; try { const o = JSON.parse(j); delete o.next_date; return JSON.stringify(o); } catch { return j; } };
+const laterNext = (a, b) => (a == null || b == null) ? null : (a > b ? a : b);
+function withNext(table, json, other) {
+  if (table !== 'recurring' || json === undefined || other === undefined) return json;
+  try { const o = JSON.parse(json), p = JSON.parse(other); o.next_date = laterNext(o.next_date ?? null, p.next_date ?? null); return JSON.stringify(o); } catch { return json; }
+}
+// Three-way compare of one table. B = last synced, L = local now, R = cloud now (Maps of id -> JSON string).
+function planTable(table, B, L, R) {
+  const cmp = table === 'recurring' ? stripNext : (x => x);
+  const plan = { push: [], del: [], apply: [], base: new Map(B), conflicts: [] };
+  for (const id of new Set([...B.keys(), ...L.keys(), ...R.keys()])) {
+    const b = B.get(id), l = L.get(id), r = R.get(id);
+    const setBase = j => { if (j === undefined) plan.base.delete(id); else plan.base.set(id, j); };
+    if (l === undefined && r === undefined) { setBase(undefined); continue; }
+    const lc = cmp(l) !== cmp(b), rc = cmp(r) !== cmp(b);
+    if (lc && rc && cmp(l) !== cmp(r)) { plan.conflicts.push({ table, id, local: l, remote: r }); continue; }
+    let m;
+    if (lc && !rc) m = withNext(table, l, r);        // only this device changed it
+    else if (!lc && rc) m = withNext(table, r, l);   // only the cloud changed it
+    else m = withNext(table, r, l);                  // unchanged, or changed the same way on both
+    if (m === undefined) {
+      if (r !== undefined) plan.del.push(id);
+      if (l !== undefined) plan.apply.push({ id, json: null });
+    } else {
+      if (m !== r) plan.push.push({ id, json: m });
+      if (m !== l) plan.apply.push({ id, json: m });
+    }
+    setBase(m);
+  }
+  return plan;
+}
+/* @merge-end */
+
+const normSettings = d => JSON.stringify({ currency: d?.currency || 'PHP', name: d?.name || '', example: !!d?.example, categories: d?.categories?.income ? { income: [...d.categories.income], expense: [...(d.categories.expense || [])] } : JSON.parse(JSON.stringify(DEFAULT_CATS)) });
+const settingsRow = () => normSettings({ ...S.settings, categories: S.categories });
+const snapshotOf = T => new Map(T.rows().map(r => [r.id, JSON.stringify(T.from(r))]));
+const localSnap = () => ({ accounts: snapshotOf(TABLES.accounts), recurring: snapshotOf(TABLES.recurring), transactions: snapshotOf(TABLES.transactions), settings: new Map([['s', settingsRow()]]) });
+function pendingCount() {
+  const L = localSnap(); let n = 0;
+  for (const k of SYNC_KEYS) {
+    const cmp = k === 'recurring' ? stripNext : (x => x);
+    for (const id of new Set([...L[k].keys(), ...base[k].keys()])) if (cmp(L[k].get(id)) !== cmp(base[k].get(id))) n++;
+  }
+  return n;
+}
+
+/* local database (IndexedDB) */
+let idbP;
+const idb = () => idbP ||= new Promise((res, rej) => { const q = indexedDB.open('ledgerbook', 1); q.onupgradeneeded = () => q.result.createObjectStore('kv'); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+const idbDo = (mode, fn) => idb().then(db => new Promise((res, rej) => { const tx = db.transaction('kv', mode), r = fn(tx.objectStore('kv')); tx.oncomplete = () => res(r && r.result); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error); }));
+const idbGet = k => idbDo('readonly', s => s.get(k));
+const idbSet = (k, v) => idbDo('readwrite', s => s.put(v, k));
+const idbDel = k => idbDo('readwrite', s => s.delete(k));
+const baseToObj = b => Object.fromEntries(SYNC_KEYS.map(k => [k, [...b[k]]]));
+const objToBase = o => { const b = emptyBase(); for (const k of SYNC_KEYS) b[k] = new Map(o?.[k] || []); return b; };
+function persistNow() {
+  clearTimeout(persistTimer);
+  const uid = curUid(); if (!uid || !UI.ready) return Promise.resolve();
+  return idbSet('state:' + uid, { v: 1, savedAt: Date.now(), S: { settings: S.settings, categories: S.categories, accounts: S.accounts, recurring: S.recurring, months: S.months }, base: baseToObj(base) }).catch(() => {});
+}
+const persistSoon = () => { clearTimeout(persistTimer); persistTimer = setTimeout(persistNow, 80); };
+async function loadLocal(uid) {
+  let st; try { st = await idbGet('state:' + uid); } catch { return false; }
+  if (!st || st.v !== 1) return false;
+  S.settings = st.S.settings; S.categories = st.S.categories; S.accounts = st.S.accounts; S.recurring = st.S.recurring; S.months = st.S.months;
+  base = objToBase(st.base); conflicts = []; return true;
+}
+
+/* cloud */
 async function fetchAll(table) {
   const out = [];
   for (let from = 0; ; from += 1000) {
@@ -317,61 +404,149 @@ async function fetchAll(table) {
   }
   return out;
 }
-async function loadAll() {
+async function pullRemote() {
   const [acc, rec, tx, st] = await Promise.all([fetchAll('accounts'), fetchAll('recurring'), fetchAll('transactions'), sb.from('settings').select('*').maybeSingle()]);
   if (st.error) throw st.error;
-  S.accounts = acc.sort((a, b) => a.created_at < b.created_at ? -1 : 1).map(toAcc);
-  S.recurring = rec.map(toRec);
-  S.months = {};
-  tx.map(toTx).forEach(t => (S.months[mkOf(t.date)] ||= []).push(t));
-  const d = st.data;
-  S.settings = { currency: d?.currency || 'PHP', name: d?.name || '', example: !!d?.example };
-  S.categories = d?.categories?.income ? { income: [...d.categories.income], expense: [...(d.categories.expense || [])] } : JSON.parse(JSON.stringify(DEFAULT_CATS));
-  markSynced();
+  const mk = (rows, f) => new Map(rows.map(r => [r.id, f(r)]));
+  acc.sort((a, b) => a.created_at < b.created_at ? -1 : 1);
+  return {
+    accounts: mk(acc, r => JSON.stringify(fromAcc(toAcc(r)))),
+    recurring: mk(rec, r => JSON.stringify(fromRec(toRec(r)))),
+    transactions: mk(tx, r => JSON.stringify(fromTx(toTx(r)))),
+    settings: st.data ? new Map([['s', normSettings(st.data)]]) : new Map()
+  };
 }
-
-let flushing = false, dirty = false, flushTimer, syncState = 'saved';
-function setSyncState(st) {
-  syncState = st; const el = $('#sync'); if (!el) return;
-  el.textContent = { saved: 'All changes saved', saving: 'Saving…', error: 'Not saved yet. Retrying…' }[st];
-  el.className = 'sync ' + st;
-}
-function schedule() { if (!session) return; dirty = true; setSyncState('saving'); clearTimeout(flushTimer); flushTimer = setTimeout(flush, 400); }
-async function flush() {
-  if (flushing || !session) return;
-  flushing = true;
-  try {
-    while (dirty) {
-      dirty = false;
-      const uid = session.user.id;
-      for (const [table, T] of Object.entries(TABLES)) {
-        const cur = snapshotOf(T), prev = synced[table];
-        const ups = [...cur].filter(([id, j]) => prev.get(id) !== j).map(([, j]) => ({ ...JSON.parse(j), user_id: uid }));
-        const dels = [...prev.keys()].filter(id => !cur.has(id));
-        for (let i = 0; i < ups.length; i += 500) { const { error } = await sb.from(table).upsert(ups.slice(i, i + 500), { onConflict: 'user_id,id' }); if (error) throw error; }
-        for (let i = 0; i < dels.length; i += 200) { const { error } = await sb.from(table).delete().in('id', dels.slice(i, i + 200)); if (error) throw error; }
-        synced[table] = cur;
-      }
-      const sr = settingsRow();
-      if (sr !== synced.settings) {
-        const { error } = await sb.from('settings').upsert({ ...JSON.parse(sr), user_id: uid, updated_at: new Date().toISOString() });
-        if (error) throw error;
-        synced.settings = sr;
-      }
-    }
-    setSyncState('saved');
-  } catch (e) {
-    dirty = true; setSyncState('error');
-    toast('Could not save: ' + (e?.message || 'network error') + '. Retrying in a few seconds.');
-    setTimeout(() => { if (dirty) flush(); }, 6000);
-  } finally {
-    flushing = false;
-    if (dirty && syncState !== 'error') flush();
+function applyRow(table, id, json) {
+  if (table === 'settings') { if (!json) return; const d = JSON.parse(json); S.settings = { currency: d.currency, name: d.name, example: !!d.example }; S.categories = d.categories; return; }
+  const row = json ? JSON.parse(json) : null;
+  const upsert = (list, conv) => { const i = list.findIndex(x => x.id === id); if (!row) { if (i >= 0) list.splice(i, 1); } else if (i >= 0) list[i] = conv(row); else list.push(conv(row)); };
+  if (table === 'accounts') upsert(S.accounts, toAcc);
+  else if (table === 'recurring') upsert(S.recurring, toRec);
+  else {
+    for (const k of Object.keys(S.months)) { const l = S.months[k], i = l.findIndex(t => t.id === id); if (i >= 0) { l.splice(i, 1); if (!l.length) delete S.months[k]; } }
+    if (row) { const t = toTx(row); (S.months[mkOf(t.date)] ||= []).push(t); }
   }
 }
+async function adoptRemote() {   // first run on this device: take the cloud copy
+  const R = await pullRemote();
+  S.accounts = [...R.accounts.values()].map(j => toAcc(JSON.parse(j)));
+  S.recurring = [...R.recurring.values()].map(j => toRec(JSON.parse(j)));
+  S.months = {};
+  [...R.transactions.values()].map(j => toTx(JSON.parse(j))).forEach(t => (S.months[mkOf(t.date)] ||= []).push(t));
+  const st = R.settings.get('s'), d = st ? JSON.parse(st) : null;
+  S.settings = { currency: d?.currency || 'PHP', name: d?.name || '', example: !!d?.example };
+  S.categories = d?.categories?.income ? d.categories : JSON.parse(JSON.stringify(DEFAULT_CATS));
+  base = { accounts: new Map(R.accounts), recurring: new Map(R.recurring), transactions: new Map(R.transactions), settings: new Map(R.settings) };   // no settings row in the cloud yet: the first sync creates it
+}
+
+/* status */
+function refreshSync() {
+  const el = $('#sync'); if (!el) return;
+  const n = UI.ready ? pendingCount() : 0;
+  let txt, cls;
+  if (conflicts.length) { txt = `${plural(conflicts.length, 'conflict')} to review`; cls = 'error'; }
+  else if (!canReach()) { txt = n ? `Offline · ${plural(n, 'change')} saved on this device` : 'Offline · all saved on this device'; cls = 'offline'; }
+  else if (syncing) { txt = 'Syncing…'; cls = 'saving'; }
+  else if (syncError) { txt = 'Not synced yet. Retrying…'; cls = 'error'; }
+  else if (n) { txt = 'Saved on this device · syncing…'; cls = 'saving'; }
+  else { txt = 'All changes saved'; cls = 'saved'; }
+  el.textContent = txt; el.className = 'sync ' + cls;
+}
+const syncSoon = (ms = 400) => { clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, ms); };
+function schedule() { if (!curUid()) return; dirty = true; persistSoon(); refreshSync(); syncSoon(400); }
 const save = { settings: schedule, accounts: schedule, categories: schedule, recurring: schedule, month: schedule };
-window.addEventListener('beforeunload', e => { if (dirty || flushing) { e.preventDefault(); e.returnValue = ''; } });
-window.addEventListener('online', () => { if (dirty) flush(); });
+
+async function syncNow() {
+  if (syncing || !UI.ready || !curUid()) return;
+  if (!canReach()) return refreshSync();
+  if (!session) { const { data } = await sb.auth.getSession().catch(() => ({ data: {} })); if (!data?.session) return showAuth('Sign in again to sync the changes saved on this device.'); session = data.session; }
+  syncing = true; syncError = false; dirty = false; refreshSync();
+  let netErr = false;
+  try {
+    const uid = session.user.id;
+    const R = await pullRemote(), L = localSnap();
+    const plans = {}; for (const k of SYNC_KEYS) plans[k] = planTable(k, base[k], L[k], R[k]);
+    for (const k of ['accounts', 'recurring', 'transactions']) {
+      const p = plans[k], ups = p.push.map(x => ({ ...JSON.parse(x.json), user_id: uid }));
+      for (let i = 0; i < ups.length; i += 500) { const { error } = await sb.from(k).upsert(ups.slice(i, i + 500), { onConflict: 'user_id,id' }); if (error) throw error; }
+      for (let i = 0; i < p.del.length; i += 200) { const { error } = await sb.from(k).delete().in('id', p.del.slice(i, i + 200)); if (error) throw error; }
+    }
+    if (plans.settings.push.length) { const { error } = await sb.from('settings').upsert({ ...JSON.parse(plans.settings.push[0].json), user_id: uid, updated_at: new Date().toISOString() }); if (error) throw error; }
+    // apply cloud changes locally, unless the record was edited while we were syncing
+    const L2 = localSnap(); let changed = false;
+    for (const k of SYNC_KEYS) for (const a of plans[k].apply) {
+      const key = k === 'settings' ? 's' : a.id;
+      if (L2[k].get(key) !== L[k].get(key)) { if (base[k].has(a.id)) plans[k].base.set(a.id, base[k].get(a.id)); else plans[k].base.delete(a.id); continue; }
+      applyRow(k, a.id, a.json); changed = true;
+    }
+    base = { accounts: plans.accounts.base, recurring: plans.recurring.base, transactions: plans.transactions.base, settings: plans.settings.base };
+    conflicts = SYNC_KEYS.flatMap(k => plans[k].conflicts);
+    if (changed) setFormats();
+    await persistNow();
+    if ((changed || conflicts.length) && !$('#modalRoot').innerHTML) render();
+  } catch (e) {
+    netErr = !canReach() || /fetch|network|load failed|timeout/i.test(e?.message || '');
+    syncError = !netErr;
+    if (!netErr) console.warn('Ledgerbook sync failed:', e);
+  } finally {
+    syncing = false; refreshSync();
+    if (syncError) syncSoon(8000); else if (dirty && canReach()) syncSoon(600);
+  }
+  const sig = conflicts.map(c => c.table + ':' + c.id).join('|');
+  if (conflicts.length && sig !== promptedSig && !$('#modalRoot').innerHTML) { promptedSig = sig; openConflicts(); }
+  if (!conflicts.length) promptedSig = '';
+}
+
+/* conflict review */
+const TABLE_LABEL = { transactions: 'Transaction', accounts: 'Account', recurring: 'Recurring transaction', settings: 'Settings & categories' };
+function describeRow(table, json) {
+  if (!json) return '<em>Deleted</em>';
+  const o = JSON.parse(json), an = id => esc(accById(id)?.name || id || '');
+  if (table === 'transactions') return `${esc(o.date)} · ${esc(o.type)} · <b class="num">${money(o.amount)}</b><br>${an(o.account)}${o.to_account ? ' → ' + an(o.to_account) : ''}${o.category ? ' · ' + esc(o.category) : ''}${o.description ? '<br>' + esc(o.description) : ''}`;
+  if (table === 'accounts') return `<b>${esc(o.name)}</b> · ${esc(o.grp)}<br>Opening balance ${money(o.opening)}`;
+  if (table === 'recurring') return `<b>${esc(o.name)}</b> · ${esc(o.type)} · <span class="num">${money(o.amount)}</span><br>${esc(FREQS[o.freq] || o.freq)} from ${esc(o.start_date)}${o.paused ? ' · paused' : ''}${o.end_date ? ' · ends ' + esc(o.end_date) : ''}`;
+  return `Currency ${esc(o.currency)} · Name "${esc(o.name)}"<br>${o.categories.income.length} income and ${o.categories.expense.length} expense categories`;
+}
+function openConflicts() {
+  if (!conflicts.length) return toast('No conflicts. Everything is in sync.');
+  const items = conflicts.map((c, i) => `<fieldset class="conf"><legend>${TABLE_LABEL[c.table]}</legend>
+    <label class="opt"><input type="radio" name="c${i}" value="local"><span><b>This device</b><br>${describeRow(c.table, c.local)}</span></label>
+    <label class="opt"><input type="radio" name="c${i}" value="remote"><span><b>Cloud (another device)</b><br>${describeRow(c.table, c.remote)}</span></label></fieldset>`).join('');
+  openModal(`<header><h3>Review conflicts</h3><button class="btn link" data-close>Later</button></header>
+    <p class="muted" style="margin:0 0 10px">These records were changed differently on this device and on another device. Choose the correct version of each one.</p>
+    <div class="conf-list">${items}</div>
+    <footer style="margin-top:14px"><button type="button" class="btn" data-act="conf-all-local">Keep all from this device</button><button type="button" class="btn" data-act="conf-all-remote">Keep all from cloud</button><button type="button" class="btn primary" data-act="conf-apply">Apply choices</button></footer>`);
+}
+async function resolveConflicts(choices) {
+  conflicts.forEach((c, i) => {
+    if (choices[i] === 'remote') applyRow(c.table, c.id, c.remote ?? null);
+    if (c.remote === undefined) base[c.table].delete(c.id); else base[c.table].set(c.id, c.remote);   // "this device" then pushes on the next sync
+  });
+  conflicts = []; promptedSig = ''; closeModal(); setFormats(); await persistNow(); render(); refreshSync(); toast('Conflicts resolved'); syncSoon(0);
+}
+
+/* sign out */
+function leaveSession() {
+  UI.ready = false; dirty = false; clearTimeout(syncTimer);
+  S.accounts = []; S.recurring = []; S.months = {}; base = emptyBase(); conflicts = [];
+  setTimeout(() => showAuth(), 0);
+}
+async function doSignOut() {
+  const n = UI.ready ? pendingCount() : 0;
+  if (n && !confirm(`${plural(n, 'change')} on this device ${n === 1 ? 'has' : 'have'} not synced yet and will be lost if you log out. Log out anyway?`)) return;
+  const uid = curUid();
+  try { if (uid) await idbDel('state:' + uid); } catch {}
+  offlineUser = null; try { localStorage.removeItem('lb:lastUser'); } catch {}
+  try { await sb.auth.signOut({ scope: canReach() ? 'global' : 'local' }); } catch {}
+  session = null; leaveSession();
+}
+
+window.addEventListener('pagehide', () => { persistNow(); });
+window.addEventListener('online', () => { refreshSync(); syncSoon(300); });
+window.addEventListener('offline', refreshSync);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') persistNow(); else if (UI.ready) { refreshSync(); syncSoon(200); } });
+setInterval(() => { if (document.visibilityState === 'visible' && UI.ready) syncSoon(0); }, 60000);
+
 
 /* ---------- recurring engine ---------- */
 function firstOcc(r) {
@@ -751,7 +926,7 @@ function viewAccounts() {
       <label class="btn" for="importFile" style="display:inline-block">Restore from backup…</label><input type="file" id="importFile" accept="application/json,.json" hidden>
       ${UI.confirm === 'wipe' ? `<button class="btn danger" data-act="wipe-yes">Yes, erase everything</button><button class="btn" data-act="cancel-confirm">Cancel</button>` : `<button class="btn danger" data-act="confirm" data-key="wipe">Erase all data</button>`}
     </div>
-    <p class="muted" style="font-size:.85rem;margin:12px 0 0">Signed in as <b>${esc(session?.user?.email || '')}</b>. Your books are stored in your own Ledgerbook database, and only you can see them. <button class="btn small" data-act="sign-out">Sign out</button></p>
+    <p class="muted" style="font-size:.85rem;margin:12px 0 0">Signed in as <b>${esc(curEmail())}</b>. Your books are stored in your own Ledgerbook database, and only you can see them. <button class="btn small" data-act="sign-out">Sign out</button></p>
   </section>`;
 }
 
@@ -1021,7 +1196,14 @@ document.addEventListener('click', e => {
     case 'export-stmt': return offerFile(`statements-${UI.month}.csv`, stmtCSV(UI.month), 'text/csv');
     case 'export-tx': return offerFile(`transactions-${todayStr()}.csv`, allTxCSV(), 'text/csv');
     case 'export-json': return offerFile(`ledgerbook-backup-${todayStr()}.json`, JSON.stringify({ app: 'ledgerbook', version: 1, ...S }, null, 1), 'application/json');
-    case 'sign-out': return sb.auth.signOut();
+    case 'sign-out': return doSignOut();
+    case 'sync-click': return conflicts.length ? openConflicts() : (canReach() ? (toast('Syncing…'), syncSoon(0)) : toast('You are offline. Changes are saved on this device and will sync when you are back online.'));
+    case 'conf-all-local': case 'conf-all-remote': { const v = act === 'conf-all-local' ? 'local' : 'remote'; document.querySelectorAll('#modalRoot .conf').forEach(f => { const r = f.querySelector(`input[value="${v}"]`); if (r) r.checked = true; }); return; }
+    case 'conf-apply': {
+      const picks = conflicts.map((c, i) => document.querySelector(`#modalRoot input[name="c${i}"]:checked`)?.value);
+      if (picks.some(x => !x)) return toast('Choose a version for every record, or use the Keep all buttons.');
+      return resolveConflicts(picks);
+    }
     case 'auth-retry': return start();
     case 'pw-toggle': {
       const inp = $('#aPass'), show = inp.type === 'password';
@@ -1112,11 +1294,22 @@ document.addEventListener('submit', async e => {
 async function start() {
   UI.ready = false; setSignedIn(true);
   $('#main').innerHTML = '<div class="loading">Opening your books…</div>';
+  const uid = curUid();
   try {
-    await loadAll(); setFormats(); UI.ready = true; setSyncState('saved');
+    if (await loadLocal(uid)) {   // the copy on this device opens instantly, online or not
+      setFormats(); UI.ready = true;
+      const n = postDue(); if (n) toast(`Recorded ${n} recurring transaction${n > 1 ? 's' : ''} that came due`);
+      render(); refreshSync(); syncSoon(0); return;
+    }
+    if (!canReach()) {
+      $('#main').innerHTML = `<section class="panel"><div class="empty"><h2>You're offline</h2><p>Open Ledgerbook once while connected to the internet so your books can be saved on this device. After that it works offline.</p><button class="btn primary" data-act="auth-retry">Try again</button></div></section>`;
+      return;
+    }
+    await adoptRemote(); setFormats(); UI.ready = true; await persistNow();
     const n = postDue(); if (n) toast(`Recorded ${n} recurring transaction${n > 1 ? 's' : ''} that came due`);
-    render();
+    render(); refreshSync(); syncSoon(0);
   } catch (e) {
+    UI.ready = false;
     const missing = /relation|does not exist|schema cache/i.test(e?.message || '');
     $('#main').innerHTML = `<section class="panel"><div class="empty"><h2>Couldn't open your books</h2>
       <p>${missing ? 'The Ledgerbook tables were not found in this Supabase project. Run schema.sql in the SQL Editor, then try again.' : esc(e?.message || 'Network error. Check your connection.')}</p>
@@ -1132,15 +1325,20 @@ if (!sb) {
 } else {
   sb.auth.onAuthStateChange((event, s) => {
     const before = session?.user?.id; session = s;
+    if (s) { offlineUser = { id: s.user.id, email: s.user.email }; try { localStorage.setItem('lb:lastUser', JSON.stringify(offlineUser)); } catch {} }
     if (s && s.user.id !== before) setTimeout(start, 0);
-    if (!s && before !== undefined) { UI.ready = false; dirty = false; S.accounts = []; S.recurring = []; S.months = {}; setTimeout(() => showAuth(), 0); }
-    if (!s && before === undefined && event === 'INITIAL_SESSION') setTimeout(() => showAuth(), 0);
+    if (!s && before !== undefined) leaveSession();
+    if (!s && before === undefined && event === 'INITIAL_SESSION') {
+      if (offlineUser && !canReach()) setTimeout(start, 0);   // offline: open the copy saved on this device
+      else setTimeout(() => showAuth(), 0);
+    }
   });
-  // pick up changes made on another device when you come back to this tab
-  document.addEventListener('visibilitychange', async () => {
-    if (document.visibilityState !== 'visible' || !session || !UI.ready || dirty || flushing || $('#modalRoot').innerHTML) return;
-    try { await loadAll(); postDue(); render(); } catch {}
-  });
+}
+// offline support: cache the app so it opens without internet
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (!hadController) toast('Ledgerbook is ready to work offline.'); });
 }
 })();
 </script>
