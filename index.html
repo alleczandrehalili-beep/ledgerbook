@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#2A5B8E">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="format-detection" content="telephone=no">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="apple-mobile-web-app-title" content="Ledgerbook">
 <title>Ledgerbook</title>
 <link rel="icon" type="image/png" href="logo-ahba.png">
@@ -184,6 +188,18 @@ td.r,th.r{text-align:right}
   .summary > div:last-child{border-bottom:0}
   .hide-sm{display:none}
   .stmt{padding:20px 12px}
+}
+/* iPhone / iPad */
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%;-webkit-tap-highlight-color:transparent}
+button,a,select,input,label,[data-act]{touch-action:manipulation}
+@media (hover:none) and (pointer:coarse){
+  input,select,textarea{font-size:16px !important}
+  .btn,button,.seg button{min-height:44px}
+  .btn.small,.btn.link,.chip button{min-height:36px}
+  .pwtoggle{min-height:40px;padding:8px 12px}
+}
+@supports (padding:max(0px)){
+  body{padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px)}
 }
 @media (prefers-reduced-motion:no-preference){ .fill{transition:width .4s ease} }
 html{padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
