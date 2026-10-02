@@ -221,6 +221,7 @@ html{padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
       </div>
       <span class="sync saved" id="sync" hidden>All changes saved</span>
       <button class="btn primary" id="quickAdd" hidden>+ Transaction</button>
+      <button class="btn" id="signOutBtn" data-act="sign-out" hidden>Log out</button>
     </div>
     <nav class="tabs" role="tablist" id="tabs" hidden>
       <button role="tab" data-tab="overview">Overview</button>
@@ -1065,7 +1066,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && $('#modalR
 /* ---------- sign-in ---------- */
 UI.authMode = 'signin';
 function setSignedIn(on) {
-  ['.monthnav', '#quickAdd', '#tabs'].forEach(q => { const el = $(q); if (el) el.hidden = !on; });
+  ['.monthnav', '#quickAdd', '#tabs', '#signOutBtn'].forEach(q => { const el = $(q); if (el) el.hidden = !on; });
   $('#sync').hidden = !on;
 }
 function showAuth(msg = '', isErr = false) {
