@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Ledgerbook">
 <title>Ledgerbook</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232A5B8E'/%3E%3Crect x='8' y='7' width='16' height='18' rx='2' fill='none' stroke='white' stroke-width='2.4'/%3E%3Cpath d='M8 18h16' stroke='white' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="icon" type="image/png" href="logo-ahba.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -46,6 +46,7 @@ h2{font-size:1.35rem} h3{font-size:1.05rem}
 .top-in{max-width:1080px;margin:0 auto;padding:12px 16px 0;display:flex;flex-direction:column;gap:10px}
 .brand-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .brand{display:flex;align-items:baseline;gap:8px;margin-right:auto}
+.brand{align-items:center}.brand .logo{height:34px;width:auto;display:block}.logo-big{display:block;height:64px;width:auto;margin:0 0 14px}
 .brand h1{font-size:1.45rem}
 .brand .mark{display:inline-block;width:14px;height:14px;border:2px solid var(--accent);border-radius:3px;background:linear-gradient(var(--accent),var(--accent)) 0 60%/100% 2px no-repeat;transform:translateY(1px)}
 .monthnav{display:flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:2px}
@@ -195,7 +196,7 @@ html{padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
 <header class="top">
   <div class="top-in">
     <div class="brand-row">
-      <div class="brand"><span class="mark" aria-hidden="true"></span><h1>Ledgerbook</h1></div>
+      <div class="brand"><img class="logo" src="logo-ahba.png" alt="AHBA Development"><h1>Ledgerbook</h1></div>
       <div class="monthnav" role="group" aria-label="Month" hidden>
         <button id="mPrev" aria-label="Previous month">‹</button>
         <div class="label" id="mLabel">—</div>
@@ -1053,6 +1054,7 @@ function showAuth(msg = '', isErr = false) {
   setSignedIn(false);
   const m = UI.authMode;
   $('#main').innerHTML = `<section class="panel auth">
+    <img class="logo-big" src="logo-ahba.png" alt="AHBA Development">
     <span class="eyebrow">Personal bookkeeping</span>
     <h2>${m === 'signup' ? 'Create your Ledgerbook account' : m === 'link' ? 'Get a sign-in link' : 'Sign in to your books'}</h2>
     <p class="muted">${m === 'link' ? 'We will email you a link that signs you in on this device. No password needed.' : 'Your accounts, transactions and statements are stored privately in your own database.'}</p>
